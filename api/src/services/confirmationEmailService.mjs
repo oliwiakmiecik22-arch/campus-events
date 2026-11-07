@@ -1,5 +1,6 @@
-import nodemailer from 'nodemailer';
 import { env } from '../config/env.mjs';
+
+const BREVO_EMAIL_API_URL = 'https://api.brevo.com/v3/smtp/email';
 
 export class ConfirmationEmailError extends Error {
   constructor(code, message) {
@@ -8,34 +9,20 @@ export class ConfirmationEmailError extends Error {
   }
 }
 
-const createTransportCloser = (transport) => {
-  let closed = false;
-
-  return () => {
-    if (closed || typeof transport.close !== 'function') {
-      return;
-    }
-    closed = true;
-
-    try {
-      Promise.resolve(transport.close()).catch(() => {});
-    } catch {
-      // Closing is best-effort and must not affect a saved registration.
-    }
-  };
-};
-
-async function sendWithTimeout(transport, message, timeoutMs, closeTransport) {
+async function sendWithTimeout(fetchImpl, url, request, timeoutMs) {
+  const controller = new AbortController();
+  let didTimeOut = false;
   let timer;
   const delivery = Promise.resolve()
-    .then(() => transport.sendMail(message))
+    .then(() => fetchImpl(url, { ...request, signal: controller.signal }))
     .then(
-      () => ({ status: 'sent' }),
-      () => ({ status: 'failed' })
+      (response) => ({ status: response.ok ? 'sent' : 'failed' }),
+      () => ({ status: didTimeOut ? 'timeout' : 'failed' })
     );
   const timeout = new Promise((resolve) => {
     timer = setTimeout(() => {
-      closeTransport();
+      didTimeOut = true;
+      controller.abort();
       resolve({ status: 'timeout' });
     }, timeoutMs);
   });
@@ -63,44 +50,48 @@ const confirmationText = (registration, event) => [
   `Location: ${event.location}`
 ].join('\n');
 
+function parseSender(emailFrom) {
+  const value = emailFrom?.trim();
+  const namedSender = value?.match(/^(.+?)\s*<([^<>\s]+@[^<>\s]+)>$/);
+  if (namedSender) {
+    return { name: namedSender[1].trim(), email: namedSender[2] };
+  }
+  if (value?.match(/^[^<>\s]+@[^<>\s]+$/)) {
+    return { email: value };
+  }
+  return null;
+}
+
 export function createConfirmationEmailSender({
-  smtpUrl = env.smtpUrl,
+  apiKey = env.brevoApiKey,
   emailFrom = env.emailFrom,
   timeoutMs = env.emailTimeoutMs,
-  transportFactory = nodemailer.createTransport
+  fetchImpl = globalThis.fetch
 } = {}) {
   return async function sendConfirmationEmail({ registration, event }) {
-    if (!smtpUrl || !emailFrom) {
+    const sender = parseSender(emailFrom);
+    if (!apiKey || !sender) {
       throw new ConfirmationEmailError('EMAIL_NOT_CONFIGURED', 'Confirmation email is not configured');
     }
 
-    let transport;
-    try {
-      transport = transportFactory(smtpUrl, {
-        connectionTimeout: timeoutMs,
-        greetingTimeout: timeoutMs,
-        socketTimeout: timeoutMs,
-        dnsTimeout: timeoutMs
-      });
-    } catch {
-      throw new ConfirmationEmailError('EMAIL_DELIVERY_FAILED', 'Confirmation email could not be sent');
-    }
-
-    const closeTransport = createTransportCloser(transport);
-    try {
-      await sendWithTimeout(transport, {
-        from: emailFrom,
-        to: registration.email,
+    await sendWithTimeout(fetchImpl, BREVO_EMAIL_API_URL, {
+      method: 'POST',
+      headers: {
+        accept: 'application/json',
+        'api-key': apiKey,
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify({
+        sender,
+        to: [{ email: registration.email, name: registration.name }],
         subject: `Registration confirmed: ${event.title}`,
-        text: confirmationText(registration, event)
-      }, timeoutMs, closeTransport);
-    } finally {
-      closeTransport();
-    }
+        textContent: confirmationText(registration, event)
+      })
+    }, timeoutMs);
   };
 }
 
 // Tests inject a fake sender. The default is disabled in test mode as an extra safeguard.
 export const sendConfirmationEmail = createConfirmationEmailSender(
-  env.nodeEnv === 'test' ? { smtpUrl: null, emailFrom: null } : undefined
+  env.nodeEnv === 'test' ? { apiKey: null, emailFrom: null } : undefined
 );

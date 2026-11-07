@@ -7,6 +7,6 @@ if (await prepareDatabase()) {
   console.log('Empty database – demo data added');
 }
 
-app.listen(env.port, () => {
+app.listen(env.port, '0.0.0.0', () => {
   console.log(`Campus Events API running on http://localhost:${env.port}/api`);
 });

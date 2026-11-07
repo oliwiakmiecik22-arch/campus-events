@@ -10,7 +10,7 @@ import {
 } from '../../src/services/registrationService.mjs';
 import { resetDatabase } from '../../src/services/setupService.mjs';
 
-const smtpUrl = 'smtp://mailer.example.test:2525';
+const apiKey = 'test-brevo-api-key';
 const emailFrom = 'Campus Events <noreply@example.com>';
 
 async function createEvent() {
@@ -29,26 +29,18 @@ async function assertRegistrationStored(eventId, email) {
   assert.equal(registrations[0].email, email);
 }
 
-function createFakeEmailSender({ sendMail, timeoutMs = 100 }) {
+function createFakeEmailSender({ fetchImpl, timeoutMs = 100 }) {
   const state = {
-    closeCalls: 0,
-    transportCalls: 0,
-    transportOptions: null
+    calls: []
   };
 
   const sender = createConfirmationEmailSender({
-    smtpUrl,
+    apiKey,
     emailFrom,
     timeoutMs,
-    transportFactory: (_url, options) => {
-      state.transportCalls += 1;
-      state.transportOptions = options;
-      return {
-        sendMail,
-        close() {
-          state.closeCalls += 1;
-        }
-      };
+    fetchImpl: async (url, options) => {
+      state.calls.push({ url, options });
+      return fetchImpl(url, options);
     }
   });
 
@@ -62,16 +54,15 @@ describe('registration confirmation email', () => {
 
   it('saves the registration before a successful plain-text email', async () => {
     const event = await createEvent();
-    let message;
     let wasStoredBeforeDelivery = false;
     const { sender, state } = createFakeEmailSender({
-      sendMail: async (mail) => {
-        message = mail;
+      fetchImpl: async () => {
         const stored = await registrationRepository.findByEventIdAndEmail(
           event.id,
           'ada@example.com'
         );
         wasStoredBeforeDelivery = Boolean(stored);
+        return { ok: true, status: 201 };
       }
     });
     const service = createRegistrationService({ sendConfirmationEmail: sender });
@@ -83,24 +74,26 @@ describe('registration confirmation email', () => {
 
     assert.equal(registration.email, 'ada@example.com');
     assert.equal(wasStoredBeforeDelivery, true);
-    assert.equal(message.from, emailFrom);
-    assert.equal(message.to, 'ada@example.com');
-    assert.match(message.text, /Backend Bootcamp/);
-    assert.match(message.text, /2030-05-20T12:00:00.000Z/);
-    assert.match(message.text, /Room C101/);
-    assert.equal(state.transportOptions.connectionTimeout, 100);
-    assert.equal(state.transportOptions.greetingTimeout, 100);
-    assert.equal(state.transportOptions.socketTimeout, 100);
-    assert.equal(state.closeCalls, 1);
+    assert.equal(state.calls.length, 1);
+    assert.equal(state.calls[0].url, 'https://api.brevo.com/v3/smtp/email');
+    assert.equal(state.calls[0].options.method, 'POST');
+    assert.equal(state.calls[0].options.headers['api-key'], apiKey);
+    const message = JSON.parse(state.calls[0].options.body);
+    assert.deepEqual(message.sender, {
+      name: 'Campus Events',
+      email: 'noreply@example.com'
+    });
+    assert.deepEqual(message.to, [{ name: 'Ada', email: 'ada@example.com' }]);
+    assert.match(message.textContent, /Backend Bootcamp/);
+    assert.match(message.textContent, /2030-05-20T12:00:00.000Z/);
+    assert.match(message.textContent, /Room C101/);
     await assertRegistrationStored(event.id, 'ada@example.com');
   });
 
-  it('keeps the registration when the provider rejects delivery', async () => {
+  it('keeps the registration when Brevo rejects the request', async () => {
     const event = await createEvent();
     const { sender, state } = createFakeEmailSender({
-      sendMail: async () => {
-        throw new Error('raw provider error with smtp credentials');
-      }
+      fetchImpl: async () => ({ ok: false, status: 400 })
     });
     const service = createRegistrationService({ sendConfirmationEmail: sender });
 
@@ -110,17 +103,20 @@ describe('registration confirmation email', () => {
     });
 
     assert.equal(registration.email, 'grace@example.com');
-    assert.equal(state.transportCalls, 1);
-    assert.equal(state.closeCalls, 1);
+    assert.equal(state.calls.length, 1);
     await assertRegistrationStored(event.id, 'grace@example.com');
   });
 
-  it('times out, closes the transport and handles a late rejection', async () => {
+  it('aborts a timed-out request and handles a late rejection', async () => {
     const event = await createEvent();
-    const { sender, state } = createFakeEmailSender({
+    let wasAborted = false;
+    const { sender } = createFakeEmailSender({
       timeoutMs: 10,
-      sendMail: () => new Promise((_resolve, reject) => {
-        setTimeout(() => reject(new Error('late provider rejection')), 30);
+      fetchImpl: (_url, { signal }) => new Promise((_resolve, reject) => {
+        signal.addEventListener('abort', () => {
+          wasAborted = true;
+          setTimeout(() => reject(new Error('late provider rejection')), 10);
+        });
       })
     });
     const service = createRegistrationService({ sendConfirmationEmail: sender });
@@ -133,23 +129,23 @@ describe('registration confirmation email', () => {
 
     assert.equal(registration.email, 'alan@example.com');
     assert.ok(Date.now() - startedAt < 500);
-    assert.equal(state.closeCalls, 1);
+    assert.equal(wasAborted, true);
     await assertRegistrationStored(event.id, 'alan@example.com');
 
     // Let the fake provider reject after the timeout; it must not become unhandled.
-    await new Promise((resolve) => setTimeout(resolve, 40));
+    await new Promise((resolve) => setTimeout(resolve, 20));
   });
 
-  it('keeps the registration when SMTP configuration is missing', async () => {
+  it('keeps the registration when Brevo configuration is missing', async () => {
     const event = await createEvent();
-    let transportCalls = 0;
+    let fetchCalls = 0;
     const sender = createConfirmationEmailSender({
-      smtpUrl: null,
-      emailFrom: null,
+      apiKey: null,
+      emailFrom,
       timeoutMs: 10,
-      transportFactory: () => {
-        transportCalls += 1;
-        throw new Error('transport must not be created');
+      fetchImpl: async () => {
+        fetchCalls += 1;
+        throw new Error('fetch must not be called');
       }
     });
     const service = createRegistrationService({ sendConfirmationEmail: sender });
@@ -160,7 +156,7 @@ describe('registration confirmation email', () => {
     });
 
     assert.equal(registration.email, 'katherine@example.com');
-    assert.equal(transportCalls, 0);
+    assert.equal(fetchCalls, 0);
     await assertRegistrationStored(event.id, 'katherine@example.com');
   });
 
