@@ -98,6 +98,19 @@ registration or change its successful `201` response.
 Email delivery is best-effort: failures are logged without SMTP credentials or raw provider errors.
 Failed messages are not queued or retried automatically.
 
+#### GET response cache
+
+Successful event lists, event details, event registrations and stats are cached in memory for up to
+5 seconds. The cache holds at most 100 entries. Health checks and error responses are never cached.
+
+Creating, updating or deleting an event immediately clears every affected entry. Saving a
+registration clears its event detail, registration list and stats before confirmation email delivery
+starts. Stats also expire when the next future event starts, so an event can change from `open` to
+`past` without waiting for the full cache TTL.
+
+This cache belongs to one Node.js process: it is empty after a restart and is not shared between
+multiple API instances.
+
 ### web/
 
 ```

@@ -1,3 +1,4 @@
+import { responseCache } from '../cache/responseCache.mjs';
 import * as databaseRepository from '../repositories/databaseRepository.mjs';
 import * as eventRepository from '../repositories/eventRepository.mjs';
 import { seedDemoData } from './demoDataService.mjs';
@@ -12,8 +13,9 @@ export async function prepareDatabase() {
   return true;
 }
 
-export function resetDatabase() {
-  return databaseRepository.syncDatabase({ force: true });
+export async function resetDatabase() {
+  await databaseRepository.syncDatabase({ force: true });
+  responseCache.clear();
 }
 
 export async function resetAndSeedDatabase() {

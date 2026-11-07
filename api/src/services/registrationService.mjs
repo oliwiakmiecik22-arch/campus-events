@@ -1,3 +1,7 @@
+import {
+  responseCache,
+  responseCacheKeys
+} from '../cache/responseCache.mjs';
 import { logger } from '../config/logger.mjs';
 import { conflict, eventNotFound } from '../errors/AppError.mjs';
 import * as eventRepository from '../repositories/eventRepository.mjs';
@@ -8,12 +12,14 @@ import {
 } from './confirmationEmailService.mjs';
 
 export async function listRegistrations(eventId) {
-  const event = await eventRepository.findById(eventId);
-  if (!event) {
-    throw eventNotFound(eventId);
-  }
+  return responseCache.getOrLoad(responseCacheKeys.registrations(eventId), async () => {
+    const event = await eventRepository.findById(eventId);
+    if (!event) {
+      throw eventNotFound(eventId);
+    }
 
-  return registrationRepository.findAllByEventId(event.id);
+    return registrationRepository.findAllByEventId(event.id);
+  });
 }
 
 async function attemptConfirmationEmail(sendConfirmationEmail, registration, event) {
@@ -56,6 +62,11 @@ export function createRegistrationService({
         name: data.name,
         email: data.email
       });
+      responseCache.invalidate(
+        responseCacheKeys.event(event.id),
+        responseCacheKeys.registrations(event.id),
+        responseCacheKeys.stats
+      );
       logger.info(`new registration for ${event.title}: ${data.name} <${data.email}>`);
 
       // The database write is complete before this best-effort external call.
