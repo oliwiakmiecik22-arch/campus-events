@@ -52,8 +52,7 @@ export function createRegistrationService({
       }
 
       const count = await registrationRepository.countByEventId(event.id);
-      // Keep the original capacity rule unchanged; correcting it is a later assignment step.
-      if (count > event.capacity) {
+      if (count >= event.capacity) {
         throw conflict('Event is full');
       }
 
