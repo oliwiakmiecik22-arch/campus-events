@@ -1,195 +1,255 @@
 # Campus Events
 
-Starter project for **Advanced Development** (Thomas More – International Experience Design, year 3).
+Campus Events is a full-stack application for browsing campus events, checking available places and
+registering participants. It has a Vue frontend and an Express REST API. The deployed application
+uses the same origin for the frontend and API.
 
-A small but complete web app: students browse campus events and register for them.
+- **Live application:** https://campus-events-api-0omf.onrender.com
+- **Submission branch:** https://github.com/oliwiakmiecik22-arch/campus-events/tree/feature/render-deployment
 
-- **api/** : REST API: Node.js, Express 5, Sequelize + SQLite/PostgreSQL, Zod
-- **web/** : frontend: Vue 3, Vue Router, Vite
+## Main features
 
-It works out of the box, and it has tests. It is also the kind of code you will meet in your first job:
-the whole API is one long file. Your job is to **clean it up, ship it to production, fix it and add the hard
-parts**
+- list events and view event details;
+- create, update and delete events through the API;
+- register a participant with duplicate and capacity checks;
+- send a plain-text registration confirmation through Brevo;
+- calculate event occupancy statistics;
+- cache successful GET data with mutation-aware invalidation;
+- serve the production Vue build from Express with Vue Router history fallback.
 
-## Quick start
+## Technology
 
-You need **Node.js 22.12 or newer** (`node -v`) and Git.
+- **API:** Node.js 22, Express 5, Sequelize 6, Zod, Winston
+- **Frontend:** Vue 3, Vue Router, Vite
+- **Local and test database:** SQLite
+- **Production database:** Neon PostgreSQL
+- **Production email:** Brevo Transactional Email API over HTTPS
+- **Tests:** `node:test`, Supertest, Vitest and Vue Test Utils
+
+## Local setup
+
+Node.js 22.12 or newer and Git are required.
 
 ```bash
-git clone <your-fork-url>
+git clone https://github.com/oliwiakmiecik22-arch/campus-events.git
 cd campus-events
-npm install        # installs api + web in one go
-npm run dev        # starts both
+git switch feature/render-deployment
+npm install
+npm run dev
 ```
 
-Open **http://localhost:5173**. The API runs on http://localhost:3000/api.
-The first start fills the database with demo events. `npm run seed` resets it.
+Open http://localhost:5173. Vite forwards `/api` requests to the Express API at
+http://localhost:3000. The first API start creates the local SQLite tables and adds demo events if
+the events table is empty.
 
-Later parts need a few services. You never need them to run the tests.
+Email is optional in local development. To configure it, copy `api/.env.example` to `api/.env` and
+fill in your own Brevo values. Tests do not need credentials and never contact Neon or Brevo.
 
-| Service | Local | Setting in `api/.env` |
-|---|---|---|
-| Database | SQLite file | optional `DATABASE_URL` selects PostgreSQL |
-| Confirmation email | disabled without configuration | `BREVO_API_KEY`, `EMAIL_FROM`, optional `EMAIL_TIMEOUT_MS` |
-| RabbitMQ | `docker compose up -d rabbitmq` | `AMQP_URL` |
-| Redis | `docker compose up -d redis` | `REDIS_URL` |
-| Identity provider | a free Auth0 tenant | `AUTH_ISSUER`, `AUTH_AUDIENCE`, `AUTH_CLIENT_ID` |
+`npm run seed` deliberately resets the selected database. It is intended for local development only
+and must not be used as a production build, pre-deploy or start command.
 
-## Scripts (run from the root folder)
+### Commands
 
-| Script | What it does |
+| Command | Purpose |
 |---|---|
-| `npm run dev` | API + frontend with auto-reload |
-| `npm test` | All tests: API (node:test + supertest) and frontend (Vitest) |
-| `npm run lint` | ESLint for the whole project |
-| `npm run check` | Lint + tests. **The pipeline runs exactly this. It must be green before you hand in.** |
-| `npm run seed` | Reset the database to the demo data |
-| `npm run build` | Production build of the frontend |
+| `npm run dev` | Start the API and Vite development servers |
+| `npm run check` | Run ESLint and all API/frontend tests |
+| `npm test` | Run all tests without lint |
+| `npm run build` | Build the production Vue application |
+| `npm run seed` | Destructively reset the selected database with demo data |
 
-## Production deployment on Render
+### Environment variables
 
-The production API serves the built Vue application, so one Render Web Service can host the complete
-app on a single origin. The free deployment uses three services:
+Only `api/src/config/env.mjs` reads `process.env`.
 
-- the existing Render Free Web Service for Express and the built Vue files;
-- Neon Free PostgreSQL for data that survives Render restarts and redeployments;
-- Brevo Free Transactional Email API over HTTPS, because Render Free blocks SMTP ports.
+| Variable | Use |
+|---|---|
+| `NODE_ENV` | Use `production` on Render |
+| `PORT` | API port; Render supplies it automatically |
+| `LOG_LEVEL` | Optional Winston log level; defaults to `info` |
+| `DB_STORAGE` | Local SQLite path; defaults to `./data/events.sqlite` |
+| `DATABASE_URL` | PostgreSQL connection URL; when present it takes precedence over SQLite |
+| `BREVO_API_KEY` | Secret key for the Brevo HTTPS API |
+| `EMAIL_FROM` | Sender address verified in Brevo |
+| `EMAIL_TIMEOUT_MS` | Overall email timeout; defaults to `3000` ms |
 
-Configure the existing Render service from the repository root:
+Never commit real environment files, connection URLs or API keys.
+
+## Layered API architecture
+
+The API follows this request flow:
+
+```text
+route → validation → controller → service → repository → Sequelize model → database
+```
+
+- `routes/` declares URLs, validation middleware and controllers.
+- `controllers/` translates HTTP requests and service results into status codes and response bodies.
+- `services/` contains application rules, cache decisions and orchestration. Services do not import
+  Express or Sequelize.
+- `repositories/` is the only layer that accesses models.
+- `models/` defines Sequelize models and associations.
+- `validation/` contains Zod schemas.
+- `middleware/` handles validation, errors, logging and the production SPA fallback.
+- `config/` contains environment, database, path and logger configuration.
+
+API errors keep the common shape:
+
+```json
+{ "error": { "code": "...", "message": "..." } }
+```
+
+Validation errors can also include a `details` array.
+
+## Registration and confirmation email flow
+
+Registration deliberately treats the database as more important than email delivery:
+
+1. load the event;
+2. reject a duplicate email;
+3. reject the registration when `count >= capacity`;
+4. save the registration;
+5. immediately invalidate the event detail, registration list and statistics cache entries;
+6. attempt the Brevo HTTPS request;
+7. return the existing successful `201` response.
+
+The Brevo sender is injectable, so automated tests use a fake `fetch` and never contact the real
+provider. The email contains the event title, date and location in plain text.
+
+The overall email timeout defaults to about three seconds. On timeout, `AbortController` cancels the
+HTTP request and the timer is cleared. Missing configuration, a non-success provider response,
+network failure or timeout is reduced to a safe internal error code. Raw provider errors and
+credentials are not logged.
+
+Email delivery is best-effort. An email failure does not remove the registration and does not turn
+the successful registration into an HTTP error. Failed emails are **not retried or queued**.
+
+## GET cache
+
+Successful event lists, event details, registration lists and statistics are cached in memory.
+
+- default TTL: **5 seconds**;
+- maximum size: **100 entries**;
+- `/api/health` and error responses are not cached;
+- statistics expire earlier when necessary so an event can become `past` at the correct time.
+
+Invalidation happens after a successful database mutation:
+
+| Mutation | Invalidated cached data |
+|---|---|
+| Create event | Event list and statistics |
+| Update event | Event list, event detail and statistics |
+| Delete event | Event list, event detail, registrations and statistics |
+| Register participant | Event detail, registrations and statistics |
+
+Each invalidation also increments a generation number. A GET operation remembers the generation
+from before its database read and only stores its result if the generation is still current. This
+prevents an in-flight read from putting stale data back into the cache after a mutation.
+
+The cache belongs to one Node.js process. It is cleared by a restart and is not shared between
+multiple application instances. This is appropriate for the current single-instance Render Free
+deployment, but it is not a distributed cache.
+
+## Databases and persistence
+
+Without `DATABASE_URL`, Sequelize uses SQLite. Local development uses a file under `api/data`, while
+tests set `DB_STORAGE=:memory:` so every test starts with isolated data.
+
+When `DATABASE_URL` is present, Sequelize uses PostgreSQL. Production uses a pooled Neon connection,
+a maximum Sequelize pool size of five and TLS with certificate verification enabled. Normal startup
+runs `sequelize.sync()` without `force`; it does not reset existing tables.
+
+The production connection, registration flow and real Brevo delivery were manually verified. A
+manual Render service restart was also performed: the saved registration and seat count remained
+unchanged after the restart. Persistence across that restart is therefore verified. A separate
+existing-data redeploy test has not been recorded.
+
+Automated database behaviour tests still run against SQLite. PostgreSQL selection and TLS options
+have unit coverage, but the test suite does not connect to the live Neon database.
+
+## Render deployment
+
+The implementation is deployed from `feature/render-deployment`. Express serves `web/dist` in
+production, including Vue Router history fallback. Unknown `/api` routes still return JSON 404
+responses instead of the Vue page.
 
 | Render setting | Value |
 |---|---|
-| Runtime | Node |
-| Root Directory | leave empty |
+| Branch | `feature/render-deployment` |
+| Root Directory | Leave empty |
 | Build Command | `npm ci --include=dev && npm run build` |
 | Start Command | `npm start -w api` |
 | Health Check Path | `/api/health` |
 
-Set these environment variables in the Render dashboard:
+Required Render environment variable names:
 
-| Variable | Required value |
-|---|---|
-| `NODE_ENV` | `production` |
-| `DATABASE_URL` | Secret pooled connection string copied from Neon |
-| `BREVO_API_KEY` | Secret API key generated in Brevo |
-| `EMAIL_FROM` | Sender verified in Brevo, e.g. `Campus Events <address@example.com>` |
-| `EMAIL_TIMEOUT_MS` | Optional; defaults to `3000` |
-| `LOG_LEVEL` | Optional; defaults to `info` |
+- `NODE_ENV=production`
+- `DATABASE_URL`
+- `BREVO_API_KEY`
+- `EMAIL_FROM`
 
-Render supplies `PORT`; it does not need a custom value. Do not set `DB_STORAGE` or `SMTP_URL` on
-Render. Do not add `npm run seed` as a build or pre-deploy command: it is deliberately destructive.
-Normal startup uses `sequelize.sync()` without `force`, so it creates missing tables without resetting
-existing records. Demo data is added only when the events table is empty.
+`EMAIL_TIMEOUT_MS` and `LOG_LEVEL` are optional. Render supplies `PORT`. Secrets are configured only
+in the Render dashboard and are not stored in this repository. Do not run `npm run seed` during
+deployment.
 
-### Connect Neon
+## API endpoints
 
-1. Create a Neon Free project and open its **Connect** panel.
-2. Select the pooled connection and copy its connection string.
-3. Save it as the secret `DATABASE_URL` in Render. Never commit it to a file.
-
-PostgreSQL connections use TLS and verify Neon's certificate with the system certificate authorities;
-the application never sets `rejectUnauthorized: false`. The Sequelize pool is limited to five
-connections. Neon, rather than Render's ephemeral filesystem, stores the production records.
-
-### Connect Brevo
-
-1. Create a Brevo Free account and activate transactional email if Brevo asks for it.
-2. Add a sender and verify its address or domain.
-3. Generate an API key and save it as the secret `BREVO_API_KEY` in Render.
-4. Set `EMAIL_FROM` in Render to the verified sender.
-
-The application calls Brevo over HTTPS with a bounded timeout. Registration is already stored and
-GET cache entries are already invalidated before the call begins. A missing key, provider error or
-timeout therefore keeps the existing successful `201` response. Failed emails are not retried.
-
-Render Free has no persistent disk, blocks SMTP ports and sleeps after inactivity. Neon and Brevo
-also have free-tier limits. Review the current [Render Free limitations](https://render.com/docs/free),
-[Neon plans](https://neon.com/docs/introduction/plans) and
-[Brevo Free limits](https://help.brevo.com/hc/en-us/articles/208580669-FAQs-What-are-the-limits-of-the-Free-plan)
-before deployment.
-
-### What has been tested
-
-Automated API tests continue to use SQLite `:memory:` and never contact Neon or Brevo. Unit tests
-verify PostgreSQL selection, certificate-verifying TLS options and Brevo request/error/timeout
-behaviour with fake `fetch`. A real Neon connection and real Brevo delivery still need a manual
-smoke test after the dashboard secrets are configured.
-
-## How it fits together
-
-```
-local:      browser ──► Vite (:5173) ──/api/*──► Express (:3000) ──► SQLite
-production: browser ──► Render Express + Vue ──► Neon PostgreSQL / Brevo HTTPS
-```
-
-In development Vite forwards every `/api/...` request to the API (see `web/vite.config.js`),
-so the browser only talks to one address and you don't need CORS.
-
-In production Express serves `web/dist` and returns its `index.html` for frontend history routes.
-Unknown `/api` routes still return the JSON API error format.
-
-### api/
-
-**Today** the whole API lives in one file:
-
-```
-api/src/app.mjs      settings, database + models, validation, routes, business rules, error handling
-api/src/server.mjs   starts the app (and adds demo data to an empty database)
-api/src/seed.mjs     npm run seed: reset the database
-```
-
-Prefered:
-
-```
-routes/        URL + validation → controller        (no logic)
-controllers/   HTTP in/out, picks the status code    (thin)
-services/      business rules, throws AppErrors      (no Express, no SQL)
-repositories/  data access via Sequelize             (no rules)
-models/ db/    tables, connection, demo data
-config/        the only place that reads process.env
-```
-
-The integration tests in `api/tests/integration` only talk HTTP. They pass before your refactoring,
-and they must still pass after it, without changing them.
-
-| Method | URL | |
+| Method | URL | Purpose |
 |---|---|---|
 | GET | `/api/health` | Health check |
-| GET / POST | `/api/events` | List / create |
-| GET / PATCH / DELETE | `/api/events/:id` | One event (incl. `registered`, `spotsLeft`) |
-| GET / POST | `/api/events/:id/registrations` | List / register `{ name, email }` |
-| GET | `/api/stats` | Occupancy per event |
+| GET / POST | `/api/events` | List or create events |
+| GET / PATCH / DELETE | `/api/events/:id` | Read, update or delete an event |
+| GET / POST | `/api/events/:id/registrations` | List or create registrations |
+| GET | `/api/stats` | Occupancy and status per event |
 
-Errors always have this shape: `{ "error": { "code", "message", "details?" } }`.
+## Verification results
 
-#### Registration confirmation email
+The final local verification completed successfully:
 
-Copy `api/.env.example` to `api/.env` and configure `BREVO_API_KEY` and a Brevo-verified
-`EMAIL_FROM` to send a plain-text confirmation after a registration is saved. `EMAIL_TIMEOUT_MS`
-sets the overall delivery timeout and defaults to 3000 ms. Missing configuration, provider errors
-and timeouts do not undo the registration or change its successful `201` response.
+- ESLint passed;
+- API tests: **39 passed**;
+- frontend tests: **10 passed**;
+- production build: **passed**.
 
-Email delivery is best-effort: failures are logged without API credentials or raw provider errors.
-Failed messages are not queued or retried automatically.
+The deployed application was also checked manually: registration succeeded, the real confirmation
+email arrived, and the registration plus seat count survived a manual Render service restart.
 
-#### GET response cache
+## Stack Overflow review references
 
-Successful event lists, event details, event registrations and stats are cached in memory for up to
-5 seconds. The cache holds at most 100 entries. Health checks and error responses are never cached.
+These answers were consulted during the **final documentation and code review**, not claimed as
+sources used earlier during implementation:
 
-Creating, updating or deleting an event immediately clears every affected entry. Saving a
-registration clears its event detail, registration list and stats before confirmation email delivery
-starts. Stats also expire when the next future event starts, so an event can change from `open` to
-`past` without waiting for the full cache TTL.
+1. [Fetch API request timeout — answer 57888548](https://stackoverflow.com/questions/46946380/fetch-api-request-timeout/57888548#57888548)
+   explained that a timeout should abort the underlying fetch rather than only win a
+   `Promise.race`, and that the timer should be cleared. This helped verify that the Brevo sender
+   passes an `AbortController` signal, aborts on timeout and clears its timer in `finally`.
+2. [How to update the cache when data changes](https://stackoverflow.com/questions/57160716/how-to-update-the-cache-when-delete-update-or-add-data)
+   — the answer by Elliot Blackburn recommended invalidating or updating cached data when the
+   underlying mutation succeeds. This helped verify the explicit invalidation calls after event
+   mutations and after the registration database save.
+3. [Detecting stale asynchronous results — answer 79928424](https://stackoverflow.com/questions/79928209/does-javascript-provide-a-built-in-way-to-detect-stale-async-results/79928424#79928424)
+   described using a request/version identifier to ignore results that became stale while awaiting
+   asynchronous work. This helped verify the cache generation check that prevents an older in-flight
+   read from repopulating data after invalidation.
 
-This cache belongs to one Node.js process: it is empty after a restart and is not shared between
-multiple API instances.
+## AI usage
 
-### web/
+AI assistance was used for code refactoring, test planning, implementation review, documentation and
+finding relevant technical references. Generated suggestions were reviewed against the repository
+rules, the code was tested locally, and only the intended files were committed. The student configured
+the hosting accounts and secrets privately, deployed the application, and manually verified the live
+registration, real email delivery and restart persistence. No credentials were supplied to the AI or
+committed to the repository.
 
-```
-api/          client.js (fetch + ApiError) and events.js (one function per endpoint)
-views/        one component per page, registered in router.js
-components/   reusable pieces: EventCard, SeatMeter, RegistrationForm, ErrorMessage
-styles.css    design tokens at the top, change those first
-```
+## Known limitations
+
+- Render Free can sleep after inactivity, so the first request can be slow.
+- The in-memory cache is single-process, is cleared on restart and is not shared across instances.
+- Failed confirmation emails are not retried.
+- Neon, Render and Brevo free tiers have usage limits and no production SLA for this assignment.
+- Automated integration tests use SQLite rather than a temporary PostgreSQL database.
+- Database schema changes use `sequelize.sync()`; the project does not have a migration system.
+- The capacity check is correct for sequential requests but is not protected by a transaction against
+  two truly simultaneous registrations for the final place.
+- Restart persistence was manually verified, but an existing-data redeploy persistence check has not
+  been recorded separately.
