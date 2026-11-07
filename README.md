@@ -29,6 +29,7 @@ Later parts need a few services. You never need them to run the tests.
 
 | Service | Local | Setting in `api/.env` |
 |---|---|---|
+| SMTP email | your SMTP provider | `SMTP_URL`, `EMAIL_FROM`, optional `EMAIL_TIMEOUT_MS` |
 | RabbitMQ | `docker compose up -d rabbitmq` | `AMQP_URL` |
 | Redis | `docker compose up -d redis` | `REDIS_URL` |
 | Identity provider | a free Auth0 tenant | `AUTH_ISSUER`, `AUTH_AUDIENCE`, `AUTH_CLIENT_ID` |
@@ -86,6 +87,16 @@ and they must still pass after it, without changing them.
 | GET | `/api/stats` | Occupancy per event |
 
 Errors always have this shape: `{ "error": { "code", "message", "details?" } }`.
+
+#### Registration confirmation email
+
+Copy `api/.env.example` to `api/.env` and configure `SMTP_URL` and `EMAIL_FROM` to send a
+plain-text confirmation after a registration is saved. `EMAIL_TIMEOUT_MS` sets the overall delivery
+timeout and defaults to 3000 ms. Missing configuration, provider errors and timeouts do not undo the
+registration or change its successful `201` response.
+
+Email delivery is best-effort: failures are logged without SMTP credentials or raw provider errors.
+Failed messages are not queued or retried automatically.
 
 ### web/
 
