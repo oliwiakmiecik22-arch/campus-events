@@ -5,21 +5,17 @@
 // hard to change safely. Part 1 of the assignment: find out why, then split it into layers.
 
 import express from 'express';
-import { DataTypes, Sequelize } from 'sequelize';
+import { EventEmitter } from 'node:events';
+import { fileURLToPath } from 'node:url';
+import { DataTypes, Op, Sequelize, Transaction } from 'sequelize';
 import { createLogger, format, transports } from 'winston';
 import { z } from 'zod';
-
-if (process.env.NODE_ENV !== 'test') {
-  try {
-    process.loadEnvFile();
-  } catch {
-    // no .env
-  }
-}
+import { env } from './config/env.mjs';
+import { registerMcpHttpRoute } from './mcp-http.mjs';
 
 const logger = createLogger({
-  level: process.env.LOG_LEVEL || 'info',
-  silent: process.env.NODE_ENV === 'test',
+  level: env.logLevel,
+  silent: env.nodeEnv === 'test',
   format: format.combine(format.timestamp(), format.json()),
   transports: [new transports.Console()]
 });
@@ -28,7 +24,7 @@ const logger = createLogger({
 
 export const sequelize = new Sequelize({
   dialect: 'sqlite',
-  storage: process.env.DB_STORAGE || './data/events.sqlite',
+  storage: env.dbStorage,
   logging: false
 });
 
@@ -43,7 +39,14 @@ export const Event = sequelize.define('Event', {
 export const Registration = sequelize.define('Registration', {
   name: { type: DataTypes.STRING(100), allowNull: false },
   email: { type: DataTypes.STRING(254), allowNull: false }
+}, { indexes: [{ unique: true, fields: ['eventId', 'email'] }] });
+
+export const Notification = sequelize.define('Notification', {
+  type: { type: DataTypes.STRING(30), allowNull: false },
+  eventTitle: { type: DataTypes.STRING(120), allowNull: false }
 });
+
+export const registrationEvents = new EventEmitter();
 
 Event.hasMany(Registration, { foreignKey: { name: 'eventId', allowNull: false }, onDelete: 'CASCADE' });
 Registration.belongsTo(Event, { foreignKey: 'eventId' });
@@ -72,9 +75,46 @@ const registrationSchema = z.object({
   email: z.email('Enter a valid email address').toLowerCase()
 });
 
+let registrationQueue = Promise.resolve();
+
+async function createRegistration(eventId, data) {
+  const outcome = await sequelize.transaction({ type: Transaction.TYPES.IMMEDIATE }, async (transaction) => {
+    const event = await Event.findByPk(eventId, { transaction });
+    if (!event) {
+      return { status: 404, error: { code: 'NOT_FOUND', message: `Event with id ${eventId} not found` } };
+    }
+
+    const existing = await Registration.findOne({ where: { eventId: event.id, email: data.email }, transaction });
+    if (existing) {
+      return { status: 409, error: { code: 'CONFLICT', message: `${data.email} is already registered for this event` } };
+    }
+
+    const count = await Registration.count({ where: { eventId: event.id }, transaction });
+    if (count >= event.capacity) {
+      return { status: 409, error: { code: 'CONFLICT', message: 'Event is full' } };
+    }
+
+    const registration = await Registration.create({ eventId: event.id, name: data.name, email: data.email }, { transaction });
+    await Notification.create({ type: 'registration', eventTitle: event.title }, { transaction });
+    return { status: 201, registration: registration.toJSON(), event: event.toJSON() };
+  });
+
+  if (outcome.error) return outcome;
+  registrationEvents.emit('registered', { event: outcome.event, registration: outcome.registration });
+  logger.info('new registration for ' + outcome.event.title + ': ' + outcome.registration.name + ' <' + outcome.registration.email + '>');
+  return { status: outcome.status, registration: outcome.registration };
+}
+
+export function registerForEvent(eventId, data) {
+  const pending = registrationQueue.then(() => createRegistration(eventId, data));
+  registrationQueue = pending.then(() => undefined, () => undefined);
+  return pending;
+}
+
 // ---------------------------------------------------------------- app
 
 export const app = express();
+app.disable('x-powered-by');
 app.use(express.json());
 
 app.use((req, res, next) => {
@@ -93,6 +133,79 @@ app.use((req, res, next) => {
 app.get('/api/health', async (req, res) => {
   await sequelize.authenticate();
   res.status(200).json({ status: 'ok' });
+});
+
+const notificationClients = new Set();
+let notificationPoll;
+let notificationHeartbeat;
+
+function sendNotification(client, notification) {
+  if (client.lastId >= notification.id) return;
+  const payload = {
+    type: notification.type,
+    message: notification.type === 'registration'
+      ? `Someone registered for ${notification.eventTitle}`
+      : `New event: ${notification.eventTitle}`
+  };
+  client.response.write(`id: ${notification.id}\nevent: notification\ndata: ${JSON.stringify(payload)}\n\n`);
+  client.lastId = notification.id;
+}
+
+export async function pollNotifications() {
+  if (notificationClients.size === 0) return;
+  try {
+    const lastIds = [...notificationClients].map((client) => client.lastId);
+    const notifications = await Notification.findAll({
+      where: { id: { [Op.gt]: Math.min(...lastIds) } },
+      order: [['id', 'ASC']],
+      limit: 100
+    });
+
+    for (const notification of notifications) {
+      for (const client of notificationClients) sendNotification(client, notification);
+    }
+  } catch (err) {
+    logger.error('notification stream poll failed', { message: err.message });
+  }
+}
+
+export function addNotificationClient(response, lastId) {
+  const client = { response, lastId };
+  notificationClients.add(client);
+  if (!notificationPoll) notificationPoll = setInterval(pollNotifications, 500);
+  if (!notificationHeartbeat) {
+    notificationHeartbeat = setInterval(() => {
+      for (const openClient of notificationClients) openClient.response.write(': heartbeat\n\n');
+    }, 15000);
+  }
+  return () => {
+    notificationClients.delete(client);
+    if (notificationClients.size === 0) {
+      clearInterval(notificationPoll);
+      notificationPoll = undefined;
+      clearInterval(notificationHeartbeat);
+      notificationHeartbeat = undefined;
+    }
+  };
+}
+
+app.get('/api/events/stream', async (req, res) => {
+  const requestedId = Number(req.get('Last-Event-ID'));
+  const lastId = Number.isSafeInteger(requestedId) && requestedId >= 0
+    ? requestedId
+    : (await Notification.max('id') || 0);
+
+  res.status(200).set({
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no'
+  });
+  res.flushHeaders();
+  res.write(': connected\n\n');
+
+  const removeClient = addNotificationClient(res, lastId);
+  res.on('close', removeClient);
 });
 
 app.get('/api/events', async (req, res) => {
@@ -133,7 +246,11 @@ app.post('/api/events', async (req, res) => {
     });
   }
 
-  const event = await Event.create(result.data);
+  const event = await sequelize.transaction(async (transaction) => {
+    const created = await Event.create(result.data, { transaction });
+    await Notification.create({ type: 'event_created', eventTitle: created.title }, { transaction });
+    return created;
+  });
   res.status(201).location('/api/events/' + event.id).json(event);
 });
 
@@ -233,30 +350,9 @@ app.post('/api/events/:id/registrations', async (req, res, next) => {
       });
     }
 
-    const ev = await Event.findByPk(p.data.id);
-    if (ev) {
-      const existing = await Registration.findOne({ where: { eventId: ev.id, email: data.data.email } });
-      if (!existing) {
-        // is the event full?
-        const count = await Registration.count({ where: { eventId: ev.id } });
-        if (count > ev.capacity) {
-          return res.status(409).json({ error: { code: 'CONFLICT', message: 'Event is full' } });
-        }
-
-        const reg = await Registration.create({ eventId: ev.id, name: data.data.name, email: data.data.email });
-        logger.info('new registration for ' + ev.title + ': ' + data.data.name + ' <' + data.data.email + '>');
-
-        // TODO send a confirmation mail
-        // const transporter = nodemailer.createTransport(process.env.SMTP_URL);
-        // await transporter.sendMail({ to: data.data.email, subject: 'You are registered for ' + ev.title });
-
-        return res.status(201).json(reg);
-      } else {
-        return res.status(409).json({ error: { code: 'CONFLICT', message: `${data.data.email} is already registered for this event` } });
-      }
-    } else {
-      return res.status(404).json({ error: { code: 'NOT_FOUND', message: `Event with id ${p.data.id} not found` } });
-    }
+    const result = await registerForEvent(p.data.id, data.data);
+    if (result.error) return res.status(result.status).json({ error: result.error });
+    return res.status(result.status).json(result.registration);
   } catch (err) {
     next(err);
   }
@@ -288,6 +384,19 @@ app.get('/api/stats', async (req, res) => {
   }
   res.json(result);
 });
+
+registerMcpHttpRoute(app, { Event, registerForEvent }, env.mcpAuthToken);
+
+if (env.nodeEnv === 'production') {
+  const frontendPath = fileURLToPath(new URL('../../web/dist/', import.meta.url));
+  app.use(express.static(frontendPath, { index: false }));
+  app.get('/{*path}', (req, res, next) => {
+    if (req.path === '/api' || req.path.startsWith('/api/')) return next();
+    res.sendFile(fileURLToPath(new URL('../../web/dist/index.html', import.meta.url)), (err) => {
+      if (err) next(err);
+    });
+  });
+}
 
 app.use((req, res) => {
   res.status(404).json({ error: { code: 'NOT_FOUND', message: `Route ${req.method} ${req.originalUrl} not found` } });

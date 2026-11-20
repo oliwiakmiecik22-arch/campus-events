@@ -25,6 +25,32 @@ npm run dev        # starts both
 Open **http://localhost:5173**. The API runs on http://localhost:3000/api.
 The first start fills the database with demo events. `npm run seed` resets it.
 
+## Assignment deployment (Render)
+
+`render.yaml` deploys one free Node web service. Express serves the production Vue build, REST API,
+SSE stream, and remote MCP endpoint from the same HTTPS origin. SQLite is ephemeral on Render Free;
+the server initializes demo events whenever it starts with an empty database. Registrations and
+created events can be lost when the instance restarts or redeploys.
+
+1. Push the assignment branch to the GitHub repository.
+2. Sign in to Render and connect the GitHub account that can access this repository.
+3. In Render, create a **Blueprint** from `render.yaml` and deploy the `campus-events` service.
+   Render will build the Vue app and generate the `MCP_AUTH_TOKEN` secret automatically.
+4. After deployment, open the service URL. The frontend is at `/`, the API health check is
+   `/api/health`, the SSE stream is `/api/events/stream`, and remote MCP uses
+   `https://<service>.onrender.com/mcp` with Streamable HTTP.
+5. To connect an external MCP client, copy `MCP_AUTH_TOKEN` from the Render service's
+   environment settings into that client's secret store and send it as
+   `Authorization: Bearer <MCP_AUTH_TOKEN>`. Never commit the production token or put it in a URL.
+
+Render Free services can sleep when idle, so the first request after inactivity may take longer.
+The SQLite file is stored under `api/data/` in the service's ephemeral filesystem and is seeded
+with demo data on startup when empty. Data does not survive all restarts or deploys.
+
+The service uses Render's HTTPS endpoint and generated secret for remote MCP authorization.
+The public REST API remains public for the Vue app and its registration flows; attendee details
+are not included in SSE messages.
+
 Later parts need a few services. You never need them to run the tests.
 
 | Service | Local | Setting in `api/.env` |
@@ -47,7 +73,9 @@ Later parts need a few services. You never need them to run the tests.
 ## How it fits together
 
 ```
-browser ──► web (Vite, :5173) ──/api/*──► api (Express, :3000) ──► SQLite (api/data/events.sqlite)
+browser ──► web (Vite, :5173) ──/api/*──► api (Express, :3000) ──► SQLite
+                                     ├── SSE: /api/events/stream
+external MCP client ──HTTPS/Streamable HTTP──► /mcp (Bearer token)
 ```
 
 In development Vite forwards every `/api/...` request to the API (see `web/vite.config.js`),

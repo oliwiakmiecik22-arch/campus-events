@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: campus-events
+    runtime: node
+    region: frankfurt
+    plan: free
+    buildCommand: npm ci && npm run build
+    startCommand: npm start -w api
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DB_STORAGE
+        value: ./data/events.sqlite
+      - key: MCP_AUTH_TOKEN
+        generateValue: true

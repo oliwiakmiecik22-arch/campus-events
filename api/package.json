@@ -7,11 +7,13 @@
   "scripts": {
     "start": "node src/server.mjs",
     "dev": "node --watch src/server.mjs",
+    "mcp": "node src/mcp-server.mjs",
     "seed": "node src/seed.mjs",
     "test": "node --env-file=.env.test --test --test-reporter=spec \"tests/**/*.test.mjs\"",
     "test:coverage": "node --env-file=.env.test --test --experimental-test-coverage \"tests/**/*.test.mjs\""
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
     "amqplib": "^2.2.0",
     "express": "^5.2.1",
     "nodemailer": "^10.0.14",
